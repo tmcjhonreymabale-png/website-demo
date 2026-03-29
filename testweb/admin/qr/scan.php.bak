@@ -1,0 +1,1147 @@
+<?php
+// admin/qr/scan.php
+
+// Start session first
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
+require_once '../../config/database.php';
+
+// Check if admin is logged in
+if (!isset($_SESSION['admin_id'])) {
+    header('Location: ../login.php');
+    exit();
+}
+
+$database = new Database();
+$db = $database->getConnection();
+
+// Create qr_codes table if it doesn't exist
+$create_table = "CREATE TABLE IF NOT EXISTS qr_codes (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    user_id INT UNIQUE,
+    qr_code_data VARCHAR(255) UNIQUE,
+    qr_code_image VARCHAR(255),
+    generated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_date DATE,
+    is_active BOOLEAN DEFAULT TRUE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+)";
+$db->exec($create_table);
+
+$scan_result = null;
+$error = '';
+$success = '';
+
+// Handle QR code generation
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['generate_qr'])) {
+    $user_id = $_POST['user_id'];
+    
+    // Check if user exists
+    $user_query = "SELECT id, first_name, last_name FROM users WHERE id = :id AND user_type = 'resident'";
+    $user_stmt = $db->prepare($user_query);
+    $user_stmt->bindParam(':id', $user_id);
+    $user_stmt->execute();
+    $user = $user_stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if ($user) {
+        // Generate unique QR code data
+        $qr_data = "BARANGAY-RESIDENT-" . str_pad($user_id, 6, '0', STR_PAD_LEFT) . "-" . date('Ymd') . "-" . uniqid();
+        $expires_date = date('Y-m-d', strtotime('+1 year'));
+        
+        // Check if QR code already exists
+        $check_query = "SELECT id FROM qr_codes WHERE user_id = :user_id";
+        $check_stmt = $db->prepare($check_query);
+        $check_stmt->bindParam(':user_id', $user_id);
+        $check_stmt->execute();
+        
+        if ($check_stmt->rowCount() > 0) {
+            // Update existing QR code
+            $update_query = "UPDATE qr_codes SET qr_code_data = :data, expires_date = :expires, generated_date = NOW(), is_active = 1 WHERE user_id = :user_id";
+            $update_stmt = $db->prepare($update_query);
+            $update_stmt->bindParam(':data', $qr_data);
+            $update_stmt->bindParam(':expires', $expires_date);
+            $update_stmt->bindParam(':user_id', $user_id);
+            $update_stmt->execute();
+        } else {
+            // Create new QR code
+            $insert_query = "INSERT INTO qr_codes (user_id, qr_code_data, expires_date) VALUES (:user_id, :data, :expires)";
+            $insert_stmt = $db->prepare($insert_query);
+            $insert_stmt->bindParam(':user_id', $user_id);
+            $insert_stmt->bindParam(':data', $qr_data);
+            $insert_stmt->bindParam(':expires', $expires_date);
+            $insert_stmt->execute();
+        }
+        
+        // Log the action
+        try {
+            $log_query = "INSERT INTO admin_logs (admin_id, action, description, ip_address) 
+                          VALUES (:admin_id, 'GENERATE_QR', :desc, :ip)";
+            $log_stmt = $db->prepare($log_query);
+            $desc = "Generated QR code for resident: " . $user['first_name'] . " " . $user['last_name'];
+            $ip = $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1';
+            $log_stmt->bindParam(':admin_id', $_SESSION['admin_id']);
+            $log_stmt->bindParam(':desc', $desc);
+            $log_stmt->bindParam(':ip', $ip);
+            $log_stmt->execute();
+        } catch (Exception $e) {
+            // Log table might not exist
+        }
+        
+        $_SESSION['success'] = "QR Code generated successfully for " . $user['first_name'] . " " . $user['last_name'];
+        header('Location: scan.php');
+        exit();
+    } else {
+        $error = "Resident not found";
+    }
+}
+
+// Handle QR code scan (manual entry)
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['scan_qr'])) {
+    $qr_input = trim($_POST['qr_input']);
+    
+    if (empty($qr_input)) {
+        $error = "Please enter QR code data";
+    } else {
+        // Try to find by QR code data
+        $qr_query = "SELECT user_id FROM qr_codes WHERE qr_code_data = :data AND is_active = 1 AND (expires_date IS NULL OR expires_date >= CURDATE())";
+        $qr_stmt = $db->prepare($qr_query);
+        $qr_stmt->bindParam(':data', $qr_input);
+        $qr_stmt->execute();
+        $qr_result = $qr_stmt->fetch(PDO::FETCH_ASSOC);
+        
+        $user_id = null;
+        
+        if ($qr_result) {
+            $user_id = $qr_result['user_id'];
+        } else {
+            // Try to extract user ID from format BARANGAY-RESIDENT-XXXXXX-...
+            if (preg_match('/BARANGAY-RESIDENT-(\d+)/', $qr_input, $matches)) {
+                $user_id = intval($matches[1]);
+            } else {
+                // Try direct user ID
+                $user_id = intval($qr_input);
+            }
+        }
+        
+        if ($user_id) {
+            // Get resident details
+            $query = "SELECT u.*, ri.* 
+                      FROM users u
+                      LEFT JOIN resident_info ri ON u.id = ri.user_id
+                      WHERE u.id = :id AND u.user_type = 'resident'";
+            $stmt = $db->prepare($query);
+            $stmt->bindParam(':id', $user_id);
+            $stmt->execute();
+            $scan_result = $stmt->fetch(PDO::FETCH_ASSOC);
+            
+            if ($scan_result) {
+                // Log the scan
+                try {
+                    $log_query = "INSERT INTO admin_logs (admin_id, action, description, ip_address) 
+                                  VALUES (:admin_id, 'QR_SCAN', :desc, :ip)";
+                    $log_stmt = $db->prepare($log_query);
+                    $desc = "Scanned QR code for resident: " . ($scan_result['first_name'] ?? '') . " " . ($scan_result['last_name'] ?? '');
+                    $ip = $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1';
+                    $log_stmt->bindParam(':admin_id', $_SESSION['admin_id']);
+                    $log_stmt->bindParam(':desc', $desc);
+                    $log_stmt->bindParam(':ip', $ip);
+                    $log_stmt->execute();
+                } catch (Exception $e) {
+                    // Log table might not exist
+                }
+                
+                $success = "Resident found successfully!";
+            } else {
+                $error = "Resident not found";
+            }
+        } else {
+            $error = "Invalid QR code or resident not found";
+        }
+    }
+}
+
+// Get all residents for QR generation dropdown
+$residents_query = "SELECT id, first_name, last_name FROM users WHERE user_type = 'resident' ORDER BY last_name, first_name";
+$residents_stmt = $db->query($residents_query);
+$residents = $residents_stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// Get recent QR codes
+$recent_query = "SELECT q.*, u.first_name, u.last_name 
+                 FROM qr_codes q
+                 JOIN users u ON q.user_id = u.id
+                 ORDER BY q.generated_date DESC LIMIT 10";
+$recent_stmt = $db->query($recent_query);
+$recent_qrs = $recent_stmt->fetchAll(PDO::FETCH_ASSOC);
+
+include '../includes/admin_header.php';
+?>
+
+<style>
+/* ===== QR SCANNER STYLES ===== */
+.qr-module {
+    width: 100%;
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 1rem;
+}
+
+/* Header */
+.module-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1.5rem;
+    flex-wrap: wrap;
+    gap: 1rem;
+}
+
+.module-title h1 {
+    font-size: 1.8rem;
+    font-weight: 600;
+    color: #1e293b;
+    margin-bottom: 0.25rem;
+}
+
+.module-title p {
+    color: #64748b;
+    font-size: 0.95rem;
+}
+
+/* Alerts */
+.alert {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 1rem;
+    margin-bottom: 1.5rem;
+    border-radius: 8px;
+    animation: slideIn 0.3s ease;
+}
+
+.alert-success {
+    background: #dcfce7;
+    color: #166534;
+    border-left: 4px solid #22c55e;
+}
+
+.alert-danger {
+    background: #fee2e2;
+    color: #991b1b;
+    border-left: 4px solid #ef4444;
+}
+
+@keyframes slideIn {
+    from {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* Scanner Container */
+.scanner-container {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+}
+
+/* Scanner Section */
+.scanner-section {
+    background: white;
+    border-radius: 12px;
+    border: 1px solid #e2e8f0;
+    overflow: hidden;
+}
+
+.scanner-header {
+    padding: 1rem 1.5rem;
+    background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+}
+
+.scanner-header h2 {
+    font-size: 1.2rem;
+    font-weight: 600;
+    color: #1e293b;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0;
+}
+
+.scanner-header h2 .material-icons {
+    color: #2563eb;
+}
+
+.scanner-body {
+    padding: 1.5rem;
+}
+
+/* QR Scanner Preview */
+.scanner-preview {
+    background: #1e293b;
+    border-radius: 12px;
+    padding: 2rem;
+    text-align: center;
+    margin-bottom: 1.5rem;
+    border: 2px dashed #4b5563;
+}
+
+.scanner-placeholder {
+    color: #94a3b8;
+}
+
+.scanner-placeholder .material-icons {
+    font-size: 4rem;
+    margin-bottom: 1rem;
+    color: #4b5563;
+}
+
+.scanner-placeholder h3 {
+    font-size: 1.2rem;
+    margin-bottom: 0.5rem;
+    color: #e2e8f0;
+}
+
+.scanner-placeholder p {
+    color: #94a3b8;
+    font-size: 0.9rem;
+}
+
+.scanner-controls {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 1rem;
+}
+
+.btn-simulate {
+    flex: 1;
+    padding: 0.75rem;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    font-weight: 500;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    transition: all 0.2s;
+    background: #8b5cf6;
+    color: white;
+}
+
+.btn-simulate:hover {
+    background: #7c3aed;
+    transform: translateY(-1px);
+}
+
+.scanner-note {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.75rem;
+    background: #f1f5f9;
+    border-radius: 8px;
+    color: #475569;
+    font-size: 0.85rem;
+}
+
+.scanner-note .material-icons {
+    font-size: 1rem;
+    color: #2563eb;
+}
+
+/* Manual Entry */
+.manual-entry {
+    background: white;
+    border-radius: 12px;
+    border: 1px solid #e2e8f0;
+    overflow: hidden;
+}
+
+.manual-header {
+    padding: 1rem 1.5rem;
+    background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+}
+
+.manual-header h2 {
+    font-size: 1.2rem;
+    font-weight: 600;
+    color: #1e293b;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0;
+}
+
+.manual-header h2 .material-icons {
+    color: #8b5cf6;
+}
+
+.manual-body {
+    padding: 1.5rem;
+}
+
+.manual-form {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.manual-form .form-group {
+    margin-bottom: 0;
+}
+
+.manual-form .form-control {
+    width: 100%;
+    padding: 0.75rem;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    font-size: 0.95rem;
+    box-sizing: border-box;
+}
+
+.manual-form .form-control:focus {
+    outline: none;
+    border-color: #8b5cf6;
+    box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.1);
+}
+
+.manual-form button {
+    padding: 0.75rem;
+    background: #8b5cf6;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    font-weight: 500;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    transition: all 0.2s;
+}
+
+.manual-form button:hover {
+    background: #7c3aed;
+}
+
+/* Result Section */
+.result-section {
+    background: white;
+    border-radius: 12px;
+    border: 1px solid #e2e8f0;
+    overflow: hidden;
+    margin-bottom: 2rem;
+}
+
+.result-header {
+    padding: 1rem 1.5rem;
+    background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 1rem;
+}
+
+.result-header h2 {
+    font-size: 1.2rem;
+    font-weight: 600;
+    color: #1e293b;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0;
+}
+
+.result-header h2 .material-icons {
+    color: #22c55e;
+}
+
+.result-badge {
+    background: #22c55e;
+    color: white;
+    padding: 0.25rem 0.75rem;
+    border-radius: 20px;
+    font-size: 0.8rem;
+    font-weight: 500;
+}
+
+.result-body {
+    padding: 1.5rem;
+}
+
+/* Resident Card */
+.resident-card {
+    display: flex;
+    gap: 2rem;
+    align-items: flex-start;
+    flex-wrap: wrap;
+}
+
+.resident-avatar-large {
+    width: 120px;
+    height: 120px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #2563eb, #1e40af);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: white;
+    font-size: 3rem;
+    font-weight: 600;
+    flex-shrink: 0;
+    overflow: hidden;
+}
+
+.resident-avatar-large img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.resident-info-large {
+    flex: 1;
+}
+
+.resident-info-large h3 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: #1e293b;
+    margin-bottom: 0.5rem;
+}
+
+.resident-meta {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+}
+
+.meta-item {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: #64748b;
+    font-size: 0.85rem;
+}
+
+.meta-item .material-icons {
+    font-size: 1rem;
+    color: #2563eb;
+}
+
+.resident-details-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+    gap: 1rem;
+    background: #f8fafc;
+    padding: 1rem;
+    border-radius: 8px;
+    margin: 1rem 0;
+}
+
+.detail-item-full {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.detail-item-full .label {
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.detail-item-full .value {
+    font-size: 0.9rem;
+    color: #1e293b;
+    font-weight: 500;
+}
+
+.resident-actions {
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+
+.btn-view, .btn-edit {
+    padding: 0.5rem 1rem;
+    border: none;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    font-weight: 500;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    text-decoration: none;
+    transition: all 0.2s;
+}
+
+.btn-view {
+    background: #2563eb;
+    color: white;
+}
+
+.btn-view:hover {
+    background: #1d4ed8;
+}
+
+.btn-edit {
+    background: #e2e8f0;
+    color: #475569;
+}
+
+.btn-edit:hover {
+    background: #cbd5e1;
+}
+
+.no-result {
+    text-align: center;
+    padding: 3rem;
+    color: #94a3b8;
+}
+
+.no-result .material-icons {
+    font-size: 3rem;
+    margin-bottom: 1rem;
+    color: #cbd5e1;
+}
+
+/* Generate QR Section */
+.generate-section {
+    background: white;
+    border-radius: 12px;
+    border: 1px solid #e2e8f0;
+    overflow: hidden;
+    margin-bottom: 2rem;
+}
+
+.generate-header {
+    padding: 1rem 1.5rem;
+    background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+}
+
+.generate-header h2 {
+    font-size: 1.2rem;
+    font-weight: 600;
+    color: #1e293b;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0;
+}
+
+.generate-header h2 .material-icons {
+    color: #eab308;
+}
+
+.generate-body {
+    padding: 1.5rem;
+}
+
+.generate-form {
+    display: flex;
+    gap: 1rem;
+    align-items: flex-end;
+    flex-wrap: wrap;
+}
+
+.generate-form .form-group {
+    flex: 1;
+    margin-bottom: 0;
+}
+
+.generate-form .form-group label {
+    display: block;
+    margin-bottom: 0.5rem;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: #475569;
+}
+
+.generate-form select {
+    width: 100%;
+    padding: 0.7rem;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    background: white;
+}
+
+.generate-form button {
+    padding: 0.7rem 1.5rem;
+    background: #eab308;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    font-weight: 500;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    transition: all 0.2s;
+    white-space: nowrap;
+}
+
+.generate-form button:hover {
+    background: #ca8a04;
+}
+
+/* Recent QR Codes */
+.recent-section {
+    background: white;
+    border-radius: 12px;
+    border: 1px solid #e2e8f0;
+    overflow: hidden;
+}
+
+.recent-header {
+    padding: 1rem 1.5rem;
+    background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+}
+
+.recent-header h2 {
+    font-size: 1.2rem;
+    font-weight: 600;
+    color: #1e293b;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0;
+}
+
+.recent-header h2 .material-icons {
+    color: #2563eb;
+}
+
+.recent-body {
+    padding: 1.5rem;
+}
+
+.table-responsive {
+    overflow-x: auto;
+}
+
+.recent-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.recent-table th {
+    text-align: left;
+    padding: 0.75rem;
+    color: #475569;
+    font-weight: 600;
+    font-size: 0.8rem;
+    border-bottom: 2px solid #e2e8f0;
+}
+
+.recent-table td {
+    padding: 0.75rem;
+    border-bottom: 1px solid #e2e8f0;
+    color: #1e293b;
+    font-size: 0.85rem;
+}
+
+.recent-table tr:hover td {
+    background: #f8fafc;
+}
+
+.qr-data {
+    font-family: monospace;
+    font-size: 0.75rem;
+    color: #2563eb;
+    background: #f1f5f9;
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    display: inline-block;
+}
+
+.status-badge {
+    display: inline-block;
+    padding: 0.25rem 0.75rem;
+    border-radius: 20px;
+    font-size: 0.7rem;
+    font-weight: 500;
+}
+
+.status-active {
+    background: #dcfce7;
+    color: #166534;
+}
+
+.status-expired {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+/* Responsive */
+@media (max-width: 1024px) {
+    .scanner-container {
+        grid-template-columns: 1fr;
+    }
+    
+    .resident-card {
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+    }
+    
+    .resident-meta {
+        justify-content: center;
+    }
+    
+    .resident-actions {
+        justify-content: center;
+    }
+}
+
+@media (max-width: 768px) {
+    .generate-form {
+        flex-direction: column;
+        align-items: stretch;
+    }
+    
+    .generate-form button {
+        width: 100%;
+        justify-content: center;
+    }
+    
+    .scanner-controls {
+        flex-direction: column;
+    }
+    
+    .resident-details-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .recent-table {
+        font-size: 0.75rem;
+    }
+    
+    .qr-data {
+        max-width: 100px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+}
+
+@media (max-width: 480px) {
+    .result-header {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+    
+    .resident-avatar-large {
+        width: 100px;
+        height: 100px;
+        font-size: 2.5rem;
+    }
+    
+    .resident-info-large h3 {
+        font-size: 1.2rem;
+    }
+}
+</style>
+
+<div class="qr-module">
+    <!-- Header -->
+    <div class="module-header">
+        <div class="module-title">
+            <h1>QR Code Scanner</h1>
+            <p>Scan resident QR codes or generate new ones</p>
+        </div>
+    </div>
+
+    <!-- Alerts -->
+    <?php if (isset($_SESSION['success'])): ?>
+        <div class="alert alert-success">
+            <span class="material-icons">check_circle</span>
+            <span><?php echo $_SESSION['success']; unset($_SESSION['success']); ?></span>
+        </div>
+    <?php endif; ?>
+
+    <?php if ($error): ?>
+        <div class="alert alert-danger">
+            <span class="material-icons">error</span>
+            <span><?php echo $error; ?></span>
+        </div>
+    <?php endif; ?>
+
+    <?php if ($success): ?>
+        <div class="alert alert-success">
+            <span class="material-icons">check_circle</span>
+            <span><?php echo $success; ?></span>
+        </div>
+    <?php endif; ?>
+
+    <!-- Scanner and Manual Entry -->
+    <div class="scanner-container">
+        <!-- QR Scanner (Simulated) -->
+        <div class="scanner-section">
+            <div class="scanner-header">
+                <h2>
+                    <span class="material-icons">qr_code_scanner</span>
+                    QR Code Scanner
+                </h2>
+            </div>
+            <div class="scanner-body">
+                <div class="scanner-preview" id="scanner-preview">
+                    <div class="scanner-placeholder">
+                        <span class="material-icons">camera_alt</span>
+                        <h3>Camera Scanner</h3>
+                        <p>Click "Simulate Scan" to test QR scanning</p>
+                    </div>
+                </div>
+                
+                <div class="scanner-controls">
+                    <button onclick="simulateScan()" class="btn-simulate">
+                        <span class="material-icons">qr_code_scanner</span>
+                        Simulate Scan
+                    </button>
+                </div>
+                
+                <div class="scanner-note">
+                    <span class="material-icons">info</span>
+                    <span>For testing: Click "Simulate Scan" and enter a resident ID (e.g., 1, 2, 3)</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Manual Entry -->
+        <div class="manual-entry">
+            <div class="manual-header">
+                <h2>
+                    <span class="material-icons">keyboard</span>
+                    Manual Entry
+                </h2>
+            </div>
+            <div class="manual-body">
+                <form method="POST" class="manual-form">
+                    <div class="form-group">
+                        <label for="qr_input">Enter QR Code Data or Resident ID</label>
+                        <input type="text" class="form-control" id="qr_input" name="qr_input" placeholder="e.g., BARANGAY-RESIDENT-000001 or 1" required>
+                    </div>
+                    <button type="submit" name="scan_qr">
+                        <span class="material-icons">search</span>
+                        Verify Resident
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scan Result -->
+    <?php if ($scan_result): ?>
+    <div class="result-section">
+        <div class="result-header">
+            <h2>
+                <span class="material-icons">check_circle</span>
+                Scan Result
+            </h2>
+            <span class="result-badge">Verified</span>
+        </div>
+        <div class="result-body">
+            <div class="resident-card">
+                <div class="resident-avatar-large">
+                    <?php echo strtoupper(substr($scan_result['first_name'] ?? '?', 0, 1) . substr($scan_result['last_name'] ?? '?', 0, 1)); ?>
+                </div>
+                
+                <div class="resident-info-large">
+                    <h3><?php echo htmlspecialchars(($scan_result['first_name'] ?? '') . ' ' . ($scan_result['last_name'] ?? '')); ?></h3>
+                    
+                    <div class="resident-meta">
+                        <span class="meta-item">
+                            <span class="material-icons">badge</span>
+                            ID: #<?php echo str_pad($scan_result['id'], 6, '0', STR_PAD_LEFT); ?>
+                        </span>
+                        <span class="meta-item">
+                            <span class="material-icons">person</span>
+                            @<?php echo htmlspecialchars($scan_result['username'] ?? ''); ?>
+                        </span>
+                    </div>
+                    
+                    <div class="resident-details-grid">
+                        <div class="detail-item-full">
+                            <span class="label">Email</span>
+                            <span class="value"><?php echo htmlspecialchars($scan_result['email'] ?? 'N/A'); ?></span>
+                        </div>
+                        <div class="detail-item-full">
+                            <span class="label">Contact Number</span>
+                            <span class="value"><?php echo htmlspecialchars($scan_result['contact_number'] ?? 'N/A'); ?></span>
+                        </div>
+                        <div class="detail-item-full">
+                            <span class="label">Age / Gender</span>
+                            <span class="value">
+                                <?php echo $scan_result['age'] ?? '?'; ?> years / 
+                                <?php echo ucfirst($scan_result['gender'] ?? 'N/A'); ?>
+                            </span>
+                        </div>
+                        <div class="detail-item-full">
+                            <span class="label">Civil Status</span>
+                            <span class="value"><?php echo ucfirst($scan_result['civil_status'] ?? 'N/A'); ?></span>
+                        </div>
+                        <div class="detail-item-full" style="grid-column: 1/-1;">
+                            <span class="label">Address</span>
+                            <span class="value"><?php echo htmlspecialchars($scan_result['address'] ?? 'N/A'); ?></span>
+                        </div>
+                    </div>
+                    
+                    <div class="resident-actions">
+                        <a href="../residents/view_resident.php?id=<?php echo $scan_result['id']; ?>" class="btn-view">
+                            <span class="material-icons">visibility</span>
+                            View Full Profile
+                        </a>
+                        <a href="../residents/edit_resident.php?id=<?php echo $scan_result['id']; ?>" class="btn-edit">
+                            <span class="material-icons">edit</span>
+                            Edit Resident
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <?php else: ?>
+    <div class="result-section">
+        <div class="result-header">
+            <h2>
+                <span class="material-icons">qr_code</span>
+                Scan Result
+            </h2>
+        </div>
+        <div class="result-body">
+            <div class="no-result">
+                <span class="material-icons">qr_code</span>
+                <p>No scan result yet. Scan a QR code or enter data manually to view resident information.</p>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+
+    <!-- Generate QR Code -->
+    <div class="generate-section">
+        <div class="generate-header">
+            <h2>
+                <span class="material-icons">qr_code_2</span>
+                Generate QR Code
+            </h2>
+        </div>
+        <div class="generate-body">
+            <form method="POST" class="generate-form">
+                <div class="form-group">
+                    <label for="user_id">Select Resident</label>
+                    <select name="user_id" id="user_id" required>
+                        <option value="">-- Choose a resident --</option>
+                        <?php foreach ($residents as $resident): ?>
+                        <option value="<?php echo $resident['id']; ?>">
+                            <?php echo htmlspecialchars($resident['last_name'] . ', ' . $resident['first_name']); ?>
+                        </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <button type="submit" name="generate_qr">
+                    <span class="material-icons">qr_code</span>
+                    Generate QR Code
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Recent QR Codes -->
+    <?php if (!empty($recent_qrs)): ?>
+    <div class="recent-section">
+        <div class="recent-header">
+            <h2>
+                <span class="material-icons">history</span>
+                Recently Generated QR Codes
+            </h2>
+        </div>
+        <div class="recent-body">
+            <div class="table-responsive">
+                <table class="recent-table">
+                    <thead>
+                        <tr>
+                            <th>Resident</th>
+                            <th>QR Code Data</th>
+                            <th>Generated</th>
+                            <th>Expires</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($recent_qrs as $qr): ?>
+                        <tr>
+                            <td><?php echo htmlspecialchars($qr['first_name'] . ' ' . $qr['last_name']); ?></td>
+                            <td><span class="qr-data"><?php echo htmlspecialchars(substr($qr['qr_code_data'], 0, 35)); ?></span></td>
+                            <td><?php echo date('M j, Y', strtotime($qr['generated_date'])); ?></td>
+                            <td><?php echo date('M j, Y', strtotime($qr['expires_date'])); ?></td>
+                            <td>
+                                <?php if (strtotime($qr['expires_date']) > time() && $qr['is_active']): ?>
+                                    <span class="status-badge status-active">Active</span>
+                                <?php else: ?>
+                                    <span class="status-badge status-expired">Expired</span>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+</div>
+
+<script>
+// Simulate QR scan
+function simulateScan() {
+    const residentId = prompt("Enter Resident ID to simulate scan (e.g., 1, 2, 3):", "1");
+    if (residentId && residentId.trim() !== "") {
+        // Create a form and submit it
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.action = '';
+        
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = 'qr_input';
+        input.value = residentId;
+        
+        form.appendChild(input);
+        document.body.appendChild(form);
+        form.submit();
+    }
+}
+
+// Close alerts after 5 seconds
+setTimeout(function() {
+    document.querySelectorAll('.alert').forEach(function(alert) {
+        alert.style.transition = 'opacity 0.5s';
+        alert.style.opacity = '0';
+        setTimeout(function() {
+            if (alert.parentNode) alert.remove();
+        }, 500);
+    });
+}, 5000);
+</script>
+
+<?php include '../includes/admin_footer.php'; ?>

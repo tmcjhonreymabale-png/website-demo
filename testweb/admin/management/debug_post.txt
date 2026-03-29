@@ -1,0 +1,44 @@
+Array
+(
+    [role_id] => 
+    [permissions] => Array
+        (
+            [0] => 
+            [1] => dashboard
+            [2] => resident_reports
+        )
+
+    [name] => Sub Admin
+    [description] => View-only access
+    [update_role] => 
+)
+Array
+(
+    [role_id] => 
+    [permissions] => Array
+        (
+            [0] => 
+            [1] => dashboard
+            [2] => resident_reports
+            [3] => page_management
+            [4] => team_management
+            [5] => scan_request_qr
+        )
+
+    [name] => Staff Admin
+    [description] => Manage residents, requests, and reports
+    [update_role] => 
+)
+Array
+(
+    [role_id] => 
+    [permissions] => Array
+        (
+            [0] => 
+            [1] => dashboard
+        )
+
+    [name] => Sub Admin
+    [description] => View-only access
+    [update_role] => 
+)
